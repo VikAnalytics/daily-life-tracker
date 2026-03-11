@@ -47,6 +47,16 @@ create table if not exists nutrition (
 create index if not exists idx_nutrition_date on nutrition (date);
 create index if not exists idx_nutrition_telegram_date on nutrition (telegram_user_id, date);
 
+-- ============================================================
+-- Daily goals (per user)
+-- ============================================================
+create table if not exists goals (
+    telegram_user_id bigint primary key,
+    fitness_minutes_goal integer not null default 30,
+    calories_goal integer not null default 2000,
+    updated_at timestamptz not null default now()
+);
+
 -- Note:
 -- If you previously enabled RLS / created user_id columns, migrate manually:
 -- - add telegram_user_id columns

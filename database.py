@@ -230,3 +230,46 @@ class DailyLogLike(TypedDict, total=False):
     fitness_activities: Sequence[Any]
     nutrition_items: Sequence[Any]
 
+
+class GoalsRecord(TypedDict):
+    telegram_user_id: int
+    fitness_minutes_goal: int
+    calories_goal: int
+
+
+def fetch_goals(telegram_user_id: int) -> GoalsRecord:
+    """Return the user's goals, or sensible defaults if none have been set."""
+    client = get_client()
+    try:
+        resp = (
+            client.table("goals")
+            .select("*")
+            .eq("telegram_user_id", telegram_user_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to fetch goals: %s", exc)
+        return GoalsRecord(telegram_user_id=telegram_user_id, fitness_minutes_goal=30, calories_goal=2000)
+
+    rows = resp.data or []
+    if not rows:
+        return GoalsRecord(telegram_user_id=telegram_user_id, fitness_minutes_goal=30, calories_goal=2000)
+    return GoalsRecord(**rows[0])  # type: ignore[arg-type]
+
+
+def upsert_goals(telegram_user_id: int, fitness_minutes_goal: int, calories_goal: int) -> None:
+    """Save or update daily goals for a user."""
+    client = get_client()
+    payload = {
+        "telegram_user_id": telegram_user_id,
+        "fitness_minutes_goal": fitness_minutes_goal,
+        "calories_goal": calories_goal,
+        "updated_at": date.today().isoformat(),
+    }
+    try:
+        client.table("goals").upsert(payload).execute()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to upsert goals: %s", exc)
+        raise RuntimeError("Database error while saving goals.") from exc
+

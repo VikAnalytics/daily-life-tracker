@@ -12,15 +12,25 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Final, List
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from database import (
+    GoalsRecord,
+    fetch_goals,
     insert_expenses,
     insert_fitness_activities,
     insert_nutrition_items,
     store_daily_log_structured,
+    upsert_goals,
 )
 from llm_extractor import DailyLog, extract_daily_log
 
@@ -34,33 +44,32 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-TEMPLATE_TEXT: Final[str] = (
-    "💰 EXPENSES:\n"
-    "- [Amount] [Currency] | [Category] | [Description] | Split with: [Name1, Name2, or None]\n"
-    "🏋️ FITNESS:\n"
-    "\n"
-    "[Activity] | [Duration in minutes]\n"
-    "\n"
-    "🍎 NUTRITION:\n"
-    "\n"
-    "[Food Item] | [Estimated Calories]\n"
-)
-
-
 DEFAULT_CURRENCY: Final[str] = os.getenv("DEFAULT_CURRENCY", "USD").upper()
 DASHBOARD_BASE_URL: Final[str] = os.getenv("DASHBOARD_BASE_URL", "").rstrip("/")
 DASHBOARD_TOKEN_SECRET: Final[str] = os.getenv("DASHBOARD_TOKEN_SECRET", "")
 
+# ─── Inline keyboards ─────────────────────────────────────────────────────────
+
+def _yes_no_keyboard(yes_cb: str, no_cb: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes", callback_data=yes_cb),
+        InlineKeyboardButton("➡️ No, move on", callback_data=no_cb),
+    ]])
+
+
+def _skip_keyboard(skip_cb: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⏭️ Skip", callback_data=skip_cb),
+    ]])
+
+
+# ─── Auth helpers ─────────────────────────────────────────────────────────────
 
 def _b64url_encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
 
 
 def _sign_dashboard_token(*, telegram_user_id: int, ttl_minutes: int = 60 * 24 * 7) -> str:
-    """
-    Create a signed token for the Streamlit dashboard.
-    Format: <payload_b64url>.<sig_b64url>
-    """
     if not DASHBOARD_TOKEN_SECRET:
         raise RuntimeError("DASHBOARD_TOKEN_SECRET must be set.")
     exp = int((datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)).timestamp())
@@ -72,30 +81,156 @@ def _sign_dashboard_token(*, telegram_user_id: int, ttl_minutes: int = 60 * 24 *
     return f"{payload_b64}.{sig_b64}"
 
 
+# ─── Template detection ───────────────────────────────────────────────────────
+
+TEMPLATE_TEXT: Final[str] = (
+    "💰 <b>EXPENSES:</b>\n"
+    "- [Amount] [Currency] | [Category] | [Description] | Split with: [Name1, Name2, or None]\n\n"
+    "🏋️ <b>FITNESS:</b>\n"
+    "[Activity] | [Duration in minutes]\n\n"
+    "🍎 <b>NUTRITION:</b>\n"
+    "[Food Item] | [Estimated Calories]"
+)
+
+
 def _looks_like_daily_template(text: str) -> bool:
-    """Loosely validate that the message matches the expected multi‑section template."""
     normalized = text.strip()
-    if "💰 EXPENSES:" not in normalized:
-        return False
-    if "🏋️ FITNESS:" not in normalized:
-        return False
-    if "🍎 NUTRITION:" not in normalized:
-        return False
-
-    # At least one expense style line beginning with a dash and containing a currency‑like token.
-    expense_line_pattern = re.compile(r"^-.*\b\d+(?:\.\d+)?\s+[A-Z]{2,10}\b.*$", re.MULTILINE)
-    if not expense_line_pattern.search(normalized):
-        # Allow days without expenses, but the sections should still exist.
-        logger.debug("No expense lines detected; continuing because sections exist.")
-
-    return True
+    return (
+        "💰 EXPENSES:" in normalized
+        and "🏋️ FITNESS:" in normalized
+        and "🍎 NUTRITION:" in normalized
+    )
 
 
-async def start_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Start an interactive, step‑by‑step logging wizard."""
+# ─── /start ───────────────────────────────────────────────────────────────────
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
+    name = update.effective_user.first_name if update.effective_user else "there"
+    await update.message.reply_text(
+        f"👋 Hey <b>{name}</b>, welcome to <b>Omni‑Tracker</b>!\n\n"
+        "I help you log your daily <b>expenses</b>, <b>fitness</b>, and <b>nutrition</b> "
+        "and show them in a beautiful dashboard.\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        "🧭 <b>What would you like to do?</b>\n\n"
+        "📝 <b>/wizard</b> — Step-by-step daily log (recommended)\n"
+        "📋 <b>/template</b> — Copy & fill the quick text format\n"
+        "📊 <b>/dashboard</b> — Open your personal stats dashboard\n"
+        "🎯 <b>/goals</b> — Set your daily fitness & calorie goals\n"
+        "❓ <b>/help</b> — See all commands & tips\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "💡 <i>Tip: Use /wizard for the easiest experience — I'll ask you one question at a time!</i>",
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
 
+
+# ─── /help ────────────────────────────────────────────────────────────────────
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+    await update.message.reply_text(
+        "📖 <b>Omni‑Tracker — Help Guide</b>\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        "📝 <b>Logging your day</b>\n\n"
+        "  • <b>/wizard</b>\n"
+        "    Chat-style guided flow — I ask one thing at a time.\n"
+        "    Covers expenses → fitness → nutrition.\n\n"
+        "  • <b>/template</b>\n"
+        "    Copy the template, fill it in, and send it back in one message.\n"
+        "    Great if you want to log everything at once.\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        "📊 <b>Viewing your stats</b>\n\n"
+        "  • <b>/dashboard</b>\n"
+        "    Sends you a private link to your personal dashboard.\n"
+        "    Works on phone — shows charts, KPIs, daily/weekly/monthly views.\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        "🎯 <b>Setting goals</b>\n\n"
+        "  • <b>/goals</b>\n"
+        "    Set your daily targets for fitness minutes and calories.\n"
+        "    Your dashboard will show progress bars vs these goals.\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        "💡 <b>Tips</b>\n"
+        "  • All your data is private — only you can see your dashboard.\n"
+        "  • Currency defaults to <code>" + DEFAULT_CURRENCY + "</code>. Mention any currency in the amount (e.g. 50 EUR).\n"
+        "  • You can log partial days — it's fine to skip sections.\n",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ─── /template ────────────────────────────────────────────────────────────────
+
+async def template(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+    await update.message.reply_text(
+        "📋 <b>Copy this template, fill in your day, and send it back:</b>\n\n"
+        + TEMPLATE_TEXT
+        + "\n\n<i>Replace the brackets with your actual values. "
+        "You can add multiple expense lines starting with '-'.</i>",
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+# ─── /dashboard ───────────────────────────────────────────────────────────────
+
+async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user is None or update.message is None:
+        return
+    if not DASHBOARD_BASE_URL:
+        await update.message.reply_text(
+            "⚠️ Dashboard URL not configured. Ask the bot admin to set <code>DASHBOARD_BASE_URL</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        token = _sign_dashboard_token(telegram_user_id=int(update.effective_user.id))
+    except Exception as exc:
+        logger.exception("Failed to sign dashboard token: %s", exc)
+        await update.message.reply_text("❌ Failed to generate a dashboard link. Try again later.")
+        return
+
+    url = f"{DASHBOARD_BASE_URL}/?token={token}"
+    await update.message.reply_text(
+        "📊 <b>Your Private Dashboard</b>\n\n"
+        "Tap the link below to open your personal stats on your phone:\n\n"
+        f"🔗 {url}\n\n"
+        "<i>This link is valid for 7 days. Get a new one anytime with /dashboard.\n"
+        "Keep it secret — it's private to you!</i>",
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+# ─── /goals ───────────────────────────────────────────────────────────────────
+
+async def goals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current goals and prompt the user to update them."""
+    if update.message is None or update.effective_user is None:
+        return
+    tid = int(update.effective_user.id)
+    goals: GoalsRecord = fetch_goals(tid)
+    context.user_data["goals_step"] = "ask_fitness_goal"
+    await update.message.reply_text(
+        "🎯 <b>Daily Goals</b>\n\n"
+        f"Current goals:\n"
+        f"  🏃 Fitness: <b>{goals['fitness_minutes_goal']} min/day</b>\n"
+        f"  🍽️ Calories: <b>{goals['calories_goal']} kcal/day</b>\n\n"
+        "Let's update them. What's your daily <b>fitness goal</b> in minutes?\n"
+        "<i>(e.g. 30 for 30 minutes per day)</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ─── Wizard ───────────────────────────────────────────────────────────────────
+
+async def start_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+    context.user_data.pop("goals_step", None)
     context.user_data["wizard"] = {
         "phase": "expenses",
         "step": "ask_expense_amount",
@@ -103,21 +238,81 @@ async def start_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "fitness": [],
         "nutrition": [],
     }
-
     await update.message.reply_text(
-        "Let's get your expenses for today.\n"
-        "Send each expense one by one.\n\n"
-        "First expense:\n"
-        "How much did you spend? (amount only, numeric)"
+        "✨ <b>Daily Log Wizard</b>\n\n"
+        "I'll ask you a few short questions to log your day.\n"
+        "Let's start with your <b>expenses</b>.\n\n"
+        "💰 <b>How much did you spend?</b>\n"
+        "<i>(Enter just the number, e.g. <code>12.50</code>. Type <code>skip</code> to skip expenses.)</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_skip_keyboard("wizard_skip_expenses"),
     )
 
 
+async def _wizard_finish(update_or_query: Any, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Persist wizard data and clean up state.
+
+    Accepts either an Update (from message handlers) or a CallbackQuery (from button handlers).
+    """
+    wizard: Dict[str, Any] = context.user_data.get("wizard", {})
+    expenses: List[Dict[str, Any]] = wizard.get("expenses", [])
+    fitness_list: List[Dict[str, Any]] = wizard.get("fitness", [])
+    nutrition_list: List[Dict[str, Any]] = wizard.get("nutrition", [])
+
+    # Support both Update objects and CallbackQuery objects
+    if isinstance(update_or_query, Update):
+        user = update_or_query.effective_user
+        msg = update_or_query.message or (update_or_query.callback_query.message if update_or_query.callback_query else None)
+    else:
+        # It's a CallbackQuery
+        user = update_or_query.from_user
+        msg = update_or_query.message
+
+    if user is None or msg is None:
+        return
+
+    telegram_user_id = int(user.id)
+    for e in expenses:
+        e["telegram_user_id"] = telegram_user_id
+    for f in fitness_list:
+        f["telegram_user_id"] = telegram_user_id
+    for n in nutrition_list:
+        n["telegram_user_id"] = telegram_user_id
+
+    try:
+        insert_expenses(expenses)
+        insert_fitness_activities(fitness_list)
+        insert_nutrition_items(nutrition_list)
+    except Exception as exc:
+        logger.exception("Failed to store wizard data: %s", exc)
+        await msg.reply_text("⚠️ I collected your entries but hit a database error while saving them.")
+    else:
+        summary_parts = []
+        if expenses:
+            summary_parts.append(f"💰 {len(expenses)} expense(s)")
+        if fitness_list:
+            summary_parts.append(f"🏃 {len(fitness_list)} fitness activity/activities")
+        if nutrition_list:
+            summary_parts.append(f"🍽️ {len(nutrition_list)} food item(s)")
+
+        if summary_parts:
+            summary = "\n".join(f"  • {p}" for p in summary_parts)
+            await msg.reply_text(
+                f"✅ <b>All done! Here's what I logged for today:</b>\n\n{summary}\n\n"
+                "View it all on your dashboard with /dashboard 📊",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await msg.reply_text("👍 Nothing to log — wizard complete.")
+
+    context.user_data.pop("wizard", None)
+
+
 async def _handle_wizard_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Route free‑text messages through the interactive wizard if it is active."""
     if update.message is None or not update.message.text:
         return
 
-    wizard: Dict[str, Any] | None = context.user_data.get("wizard")  # type: ignore[assignment]
+    wizard: Dict[str, Any] | None = context.user_data.get("wizard")
     if not wizard:
         return
 
@@ -125,93 +320,103 @@ async def _handle_wizard_message(update: Update, context: ContextTypes.DEFAULT_T
     phase = wizard.get("phase")
     step = wizard.get("step")
 
-    # Helper to parse yes/no
-    def is_yes(value: str) -> bool:
-        return value.lower() in {"y", "yes", "yeah", "yep"}
-
-    def is_no(value: str) -> bool:
-        return value.lower() in {"n", "no", "nope"}
-
-    # EXPENSES FLOW
+    # ── EXPENSES ──────────────────────────────────────────────────
     if phase == "expenses":
         if step == "ask_expense_amount":
+            if text.lower() == "skip":
+                wizard["phase"] = "fitness"
+                wizard["step"] = "ask_activity"
+                await update.message.reply_text(
+                    "Skipping expenses. 🏋️ <b>Fitness time!</b>\n\n"
+                    "What activity did you do today?\n"
+                    "<i>(e.g. Running, Yoga, Cycling — or type <code>skip</code>)</i>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_skip_keyboard("wizard_skip_fitness"),
+                )
+                return
             try:
                 amount = float(text)
             except ValueError:
-                await update.message.reply_text("Please enter just the amount as a number, e.g. 120 or 120.50.")
+                await update.message.reply_text("Please enter just the amount as a number, e.g. <code>12.50</code>.", parse_mode=ParseMode.HTML)
                 return
-
             wizard["current_expense"] = {"amount": amount}
+            wizard["step"] = "ask_expense_currency"
+            await update.message.reply_text(
+                f"💱 <b>What currency?</b>\n"
+                f"<i>(e.g. USD, EUR, INR — or press Enter to use <b>{DEFAULT_CURRENCY}</b>)</i>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if step == "ask_expense_currency":
+            current = wizard.get("current_expense", {})
+            if text.upper() in ["", "-", "DEFAULT", DEFAULT_CURRENCY] or len(text) < 2:
+                current["currency"] = DEFAULT_CURRENCY
+            else:
+                current["currency"] = text.upper()[:10]
+            wizard["current_expense"] = current
             wizard["step"] = "ask_expense_description"
-            await update.message.reply_text("What did you spend it on? (short description)")
+            await update.message.reply_text(
+                "📝 <b>What did you spend it on?</b>\n<i>(Short description, e.g. Lunch, Uber, Groceries)</i>",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         if step == "ask_expense_description":
             current = wizard.get("current_expense", {})
             current["description"] = text
-            # Simple default category
-            current["category"] = "General"
+            current["category"] = _guess_category(text)
             wizard["current_expense"] = current
             wizard["step"] = "ask_expense_split"
             await update.message.reply_text(
-                "Did you split it with anyone? "
-                "Reply with comma‑separated names (e.g. Alice,Bob) or 'none'."
+                "👥 <b>Did you split this with anyone?</b>\n"
+                "<i>Enter comma-separated names (e.g. <code>Alice, Bob</code>) or tap None.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🙋 Just me", callback_data="wizard_split_none"),
+                ]]),
             )
             return
 
         if step == "ask_expense_split":
-            current = wizard.get("current_expense", {})
-            if text.lower() == "none":
-                split_with: List[str] = []
-            else:
-                split_with = [name.strip() for name in text.split(",") if name.strip()]
-
-            expense_payload = {
-                "date": _date.today().isoformat(),
-                "amount": float(current.get("amount", 0.0)),
-                "currency": DEFAULT_CURRENCY,
-                "category": current.get("category", "General"),
-                "description": current.get("description", ""),
-                "split_with": split_with,
-            }
-            expenses: List[Dict[str, Any]] = wizard.get("expenses", [])
-            expenses.append(expense_payload)
-            wizard["expenses"] = expenses
-            wizard.pop("current_expense", None)
-
+            split_with: List[str] = [] if text.lower() in {"none", "no", "-", ""} else [n.strip() for n in text.split(",") if n.strip()]
+            _commit_expense(wizard, split_with)
             wizard["step"] = "ask_more_expenses"
             await update.message.reply_text(
-                "Do you have more expenses to enter? (yes/no)"
+                "➕ <b>Any more expenses to add?</b>",
+                reply_markup=_yes_no_keyboard("wizard_more_expenses", "wizard_done_expenses"),
             )
             return
 
         if step == "ask_more_expenses":
-            if is_yes(text):
+            if text.lower() in {"y", "yes"}:
                 wizard["step"] = "ask_expense_amount"
                 await update.message.reply_text(
-                    "Next expense:\nHow much did you spend? (amount only, numeric)"
+                    "💰 <b>Next expense — how much?</b>",
+                    parse_mode=ParseMode.HTML,
                 )
-                return
-            if not is_no(text):
-                await update.message.reply_text("Please answer 'yes' or 'no'.")
-                return
-
-            # Move to fitness phase
-            wizard["phase"] = "fitness"
-            wizard["step"] = "ask_activity"
-            await update.message.reply_text(
-                "Great. Let's move on to fitness.\n"
-                "What activity did you do? (e.g. Running, Walking)"
-            )
+            else:
+                await _transition_to_fitness(update, wizard)
             return
 
-    # FITNESS FLOW
+    # ── FITNESS ──────────────────────────────────────────────────
     if phase == "fitness":
         if step == "ask_activity":
-            wizard["current_activity"] = {"activity_type": text}
+            if text.lower() == "skip":
+                wizard["phase"] = "nutrition"
+                wizard["step"] = "ask_food"
+                await update.message.reply_text(
+                    "Skipping fitness. 🍽️ <b>Nutrition time!</b>\n\n"
+                    "What did you eat today?\n<i>(Or type <code>skip</code> to skip)</i>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_skip_keyboard("wizard_skip_nutrition"),
+                )
+                return
+            wizard["current_activity"] = {"activity_type": text.title()}
             wizard["step"] = "ask_duration"
             await update.message.reply_text(
-                "How long did you do it for? (duration in minutes, numeric)"
+                "⏱️ <b>How long?</b> (in minutes)\n<i>(e.g. <code>30</code>)</i>",
+                parse_mode=ParseMode.HTML,
             )
             return
 
@@ -219,55 +424,41 @@ async def _handle_wizard_message(update: Update, context: ContextTypes.DEFAULT_T
             try:
                 minutes = int(text)
             except ValueError:
-                await update.message.reply_text(
-                    "Please enter the duration as whole minutes, e.g. 30."
-                )
+                await update.message.reply_text("Please enter whole minutes, e.g. <code>30</code>.", parse_mode=ParseMode.HTML)
                 return
-
             current = wizard.get("current_activity", {})
-            fitness_payload = {
+            wizard["fitness"].append({
                 "date": _date.today().isoformat(),
                 "activity_type": current.get("activity_type", ""),
                 "duration_minutes": minutes,
-            }
-            fitness_list: List[Dict[str, Any]] = wizard.get("fitness", [])
-            fitness_list.append(fitness_payload)
-            wizard["fitness"] = fitness_list
+            })
             wizard.pop("current_activity", None)
-
             wizard["step"] = "ask_more_fitness"
             await update.message.reply_text(
-                "Any more fitness activities to add? (yes/no)"
+                "➕ <b>Any more fitness activities?</b>",
+                reply_markup=_yes_no_keyboard("wizard_more_fitness", "wizard_done_fitness"),
             )
             return
 
         if step == "ask_more_fitness":
-            if is_yes(text):
+            if text.lower() in {"y", "yes"}:
                 wizard["step"] = "ask_activity"
-                await update.message.reply_text(
-                    "Next activity:\nWhat did you do?"
-                )
-                return
-            if not is_no(text):
-                await update.message.reply_text("Please answer 'yes' or 'no'.")
-                return
-
-            # Move to nutrition phase
-            wizard["phase"] = "nutrition"
-            wizard["step"] = "ask_food"
-            await update.message.reply_text(
-                "Now let's track your nutrition.\n"
-                "What did you eat? (food item)"
-            )
+                await update.message.reply_text("🏋️ <b>Next activity — what did you do?</b>", parse_mode=ParseMode.HTML)
+            else:
+                await _transition_to_nutrition(update, wizard)
             return
 
-    # NUTRITION FLOW
+    # ── NUTRITION ─────────────────────────────────────────────────
     if phase == "nutrition":
         if step == "ask_food":
-            wizard["current_food"] = {"food_item": text}
+            if text.lower() == "skip":
+                await _wizard_finish(update, context)
+                return
+            wizard["current_food"] = {"food_item": text.title()}
             wizard["step"] = "ask_calories"
             await update.message.reply_text(
-                "Roughly how many calories was that? (numeric)"
+                "🔢 <b>Roughly how many calories?</b>\n<i>(e.g. <code>250</code>)</i>",
+                parse_mode=ParseMode.HTML,
             )
             return
 
@@ -275,187 +466,295 @@ async def _handle_wizard_message(update: Update, context: ContextTypes.DEFAULT_T
             try:
                 calories = int(text)
             except ValueError:
-                await update.message.reply_text(
-                    "Please enter calories as a whole number, e.g. 250."
-                )
+                await update.message.reply_text("Please enter calories as a whole number, e.g. <code>250</code>.", parse_mode=ParseMode.HTML)
                 return
-
             current = wizard.get("current_food", {})
-            nutrition_payload = {
+            wizard["nutrition"].append({
                 "date": _date.today().isoformat(),
                 "food_item": current.get("food_item", ""),
                 "calories": calories,
-            }
-            nutrition_list: List[Dict[str, Any]] = wizard.get("nutrition", [])
-            nutrition_list.append(nutrition_payload)
-            wizard["nutrition"] = nutrition_list
+            })
             wizard.pop("current_food", None)
-
             wizard["step"] = "ask_more_nutrition"
             await update.message.reply_text(
-                "Any more food items to add? (yes/no)"
+                "➕ <b>Anything else to add to nutrition?</b>",
+                reply_markup=_yes_no_keyboard("wizard_more_nutrition", "wizard_done_nutrition"),
             )
             return
 
         if step == "ask_more_nutrition":
-            if is_yes(text):
+            if text.lower() in {"y", "yes"}:
                 wizard["step"] = "ask_food"
-                await update.message.reply_text(
-                    "Next item:\nWhat did you eat?"
-                )
-                return
-            if not is_no(text):
-                await update.message.reply_text("Please answer 'yes' or 'no'.")
-                return
-
-            # Finish: write everything to the database
-            expenses: List[Dict[str, Any]] = wizard.get("expenses", [])
-            fitness_list: List[Dict[str, Any]] = wizard.get("fitness", [])
-            nutrition_list: List[Dict[str, Any]] = wizard.get("nutrition", [])
-
-            if update.effective_user is None:
-                await update.message.reply_text("Couldn't identify your Telegram user. Please try again.")
-                context.user_data.pop("wizard", None)
-                return
-
-            telegram_user_id = int(update.effective_user.id)
-            for e in expenses:
-                e["telegram_user_id"] = telegram_user_id
-            for f in fitness_list:
-                f["telegram_user_id"] = telegram_user_id
-            for n in nutrition_list:
-                n["telegram_user_id"] = telegram_user_id
-
-            try:
-                insert_expenses(expenses)
-                insert_fitness_activities(fitness_list)
-                insert_nutrition_items(nutrition_list)
-            except Exception as exc:  # noqa: BLE001
-                logging.exception("Failed to store wizard data: %s", exc)
-                await update.message.reply_text(
-                    "I collected your entries but hit a database error while saving them."
-                )
+                await update.message.reply_text("🍽️ <b>Next item — what did you eat?</b>", parse_mode=ParseMode.HTML)
             else:
-                await update.message.reply_text(
-                    f"All set! Logged {len(expenses)} expenses, "
-                    f"{len(fitness_list)} fitness activities, and "
-                    f"{len(nutrition_list)} nutrition items for today. ✅"
-                )
-
-            # Clear wizard state
-            context.user_data.pop("wizard", None)
+                await _wizard_finish(update, context)
             return
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the /start command."""
-    if update.message is None:
-        return
-    await update.message.reply_text(
-        "Welcome to Omni‑Tracker!\n\n"
-        "Copy this template, fill in your day, and send it back as a single message:\n\n"
-        f"{TEMPLATE_TEXT}",
+def _commit_expense(wizard: Dict[str, Any], split_with: List[str]) -> None:
+    current = wizard.get("current_expense", {})
+    wizard["expenses"].append({
+        "date": _date.today().isoformat(),
+        "amount": float(current.get("amount", 0.0)),
+        "currency": current.get("currency", DEFAULT_CURRENCY),
+        "category": current.get("category", "General"),
+        "description": current.get("description", ""),
+        "split_with": split_with,
+    })
+    wizard.pop("current_expense", None)
+
+
+def _guess_category(description: str) -> str:
+    desc = description.lower()
+    mapping = {
+        "Food": ["lunch", "dinner", "breakfast", "coffee", "cafe", "restaurant", "food", "eat", "snack", "pizza", "burger"],
+        "Transport": ["uber", "taxi", "bus", "metro", "train", "petrol", "fuel", "parking", "flight", "travel"],
+        "Shopping": ["amazon", "shop", "store", "mall", "clothes", "shoes", "buy", "purchase"],
+        "Health": ["pharmacy", "doctor", "medicine", "gym", "health", "hospital"],
+        "Entertainment": ["movie", "netflix", "spotify", "game", "concert", "bar", "club"],
+        "Utilities": ["electricity", "water", "internet", "phone", "rent", "wifi"],
+    }
+    for cat, keywords in mapping.items():
+        if any(kw in desc for kw in keywords):
+            return cat
+    return "General"
+
+
+async def _transition_to_fitness(msg_source: Any, wizard: Dict[str, Any]) -> None:
+    """msg_source can be an Update (has .message) or a Message directly."""
+    wizard["phase"] = "fitness"
+    wizard["step"] = "ask_activity"
+    msg = msg_source.message if isinstance(msg_source, Update) else msg_source
+    await msg.reply_text(
+        "🏋️ <b>Fitness time!</b>\n\n"
+        "What physical activity did you do today?\n"
+        "<i>(e.g. Running, Yoga, Cycling — or type <code>skip</code>)</i>",
         parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
+        reply_markup=_skip_keyboard("wizard_skip_fitness"),
     )
 
 
-async def template(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the /template command."""
-    if update.message is None:
-        return
-    await update.message.reply_text(TEMPLATE_TEXT, disable_web_page_preview=True)
+async def _transition_to_nutrition(msg_source: Any, wizard: Dict[str, Any]) -> None:
+    """msg_source can be an Update (has .message) or a Message directly."""
+    wizard["phase"] = "nutrition"
+    wizard["step"] = "ask_food"
+    msg = msg_source.message if isinstance(msg_source, Update) else msg_source
+    await msg.reply_text(
+        "🍽️ <b>Nutrition time!</b>\n\n"
+        "What did you eat today? Log one item at a time.\n"
+        "<i>(Or type <code>skip</code> to skip nutrition)</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_skip_keyboard("wizard_skip_nutrition"),
+    )
 
-async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a signed dashboard link suitable for phone viewing."""
-    if update.effective_user is None or update.message is None:
+
+# ─── Callback query handler (inline keyboard buttons) ─────────────────────────
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
         return
-    if not DASHBOARD_BASE_URL:
+    await query.answer()
+
+    data = query.data
+    wizard: Dict[str, Any] | None = context.user_data.get("wizard")
+
+    # ── Wizard yes/no ──────────────────────────────────────────────
+    if data == "wizard_more_expenses":
+        if wizard:
+            wizard["step"] = "ask_expense_amount"
+        await query.message.reply_text("💰 <b>Next expense — how much?</b>", parse_mode=ParseMode.HTML)
+
+    elif data == "wizard_done_expenses":
+        if wizard:
+            await _transition_to_fitness(query.message, wizard)
+
+    elif data == "wizard_more_fitness":
+        if wizard:
+            wizard["step"] = "ask_activity"
+        await query.message.reply_text("🏋️ <b>Next activity — what did you do?</b>", parse_mode=ParseMode.HTML)
+
+    elif data == "wizard_done_fitness":
+        if wizard:
+            await _transition_to_nutrition(query.message, wizard)
+
+    elif data == "wizard_more_nutrition":
+        if wizard:
+            wizard["step"] = "ask_food"
+        await query.message.reply_text("🍽️ <b>What did you eat?</b>", parse_mode=ParseMode.HTML)
+
+    elif data == "wizard_done_nutrition":
+        await _wizard_finish(query, context)
+
+    elif data == "wizard_split_none":
+        if wizard:
+            _commit_expense(wizard, [])
+            wizard["step"] = "ask_more_expenses"
+        await query.message.reply_text(
+            "➕ <b>Any more expenses to add?</b>",
+            reply_markup=_yes_no_keyboard("wizard_more_expenses", "wizard_done_expenses"),
+        )
+
+    elif data == "wizard_skip_expenses":
+        if wizard:
+            wizard["phase"] = "fitness"
+            wizard["step"] = "ask_activity"
+        await query.message.reply_text(
+            "🏋️ <b>Fitness time!</b>\n\nWhat activity did you do today?\n<i>(Or type <code>skip</code>)</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_skip_keyboard("wizard_skip_fitness"),
+        )
+
+    elif data == "wizard_skip_fitness":
+        if wizard:
+            wizard["phase"] = "nutrition"
+            wizard["step"] = "ask_food"
+        await query.message.reply_text(
+            "🍽️ <b>Nutrition time!</b>\n\nWhat did you eat?\n<i>(Or type <code>skip</code>)</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_skip_keyboard("wizard_skip_nutrition"),
+        )
+
+    elif data == "wizard_skip_nutrition":
+        await _wizard_finish(query, context)
+
+
+# ─── Goals conversation ───────────────────────────────────────────────────────
+
+async def _handle_goals_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or not update.message.text:
+        return
+    if update.effective_user is None:
+        return
+
+    step = context.user_data.get("goals_step")
+    text = update.message.text.strip()
+    tid = int(update.effective_user.id)
+
+    if step == "ask_fitness_goal":
+        try:
+            fit_goal = int(text)
+            if fit_goal < 1:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Please enter a positive whole number, e.g. <code>30</code>.", parse_mode=ParseMode.HTML)
+            return
+        context.user_data["goals_fit"] = fit_goal
+        context.user_data["goals_step"] = "ask_calorie_goal"
         await update.message.reply_text(
-            "Dashboard URL not configured. Set DASHBOARD_BASE_URL in the bot environment."
+            f"✅ Fitness goal set to <b>{fit_goal} min/day</b>.\n\n"
+            "🍽️ <b>What's your daily calorie goal?</b>\n<i>(e.g. <code>2000</code> kcal)</i>",
+            parse_mode=ParseMode.HTML,
         )
         return
-    try:
-        token = _sign_dashboard_token(telegram_user_id=int(update.effective_user.id))
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Failed to sign dashboard token: %s", exc)
-        await update.message.reply_text("Failed to generate a dashboard link. Try again later.")
-        return
 
-    url = f"{DASHBOARD_BASE_URL}/?token={token}"
-    await update.message.reply_text(
-        "Here’s your private dashboard link (works on phone). Keep it secret:\n\n"
-        f"{url}"
-    )
+    if step == "ask_calorie_goal":
+        try:
+            cal_goal = int(text)
+            if cal_goal < 100:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Please enter a reasonable number, e.g. <code>2000</code>.", parse_mode=ParseMode.HTML)
+            return
+        fit_goal = context.user_data.pop("goals_fit", 30)
+        context.user_data.pop("goals_step", None)
+        try:
+            upsert_goals(tid, fit_goal, cal_goal)
+        except Exception as exc:
+            logger.exception("Failed to save goals: %s", exc)
+            await update.message.reply_text("⚠️ Couldn't save goals right now. Try again later.")
+            return
+        await update.message.reply_text(
+            f"🎯 <b>Goals saved!</b>\n\n"
+            f"  🏃 Fitness: <b>{fit_goal} min/day</b>\n"
+            f"  🍽️ Calories: <b>{cal_goal} kcal/day</b>\n\n"
+            "Your dashboard will now show progress bars against these targets. 📊\n"
+            "You can also update them anytime in the sidebar of your dashboard.",
+            parse_mode=ParseMode.HTML,
+        )
 
 
-async def handle_daily_log(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle arbitrary text messages.
+# ─── Main message router ──────────────────────────────────────────────────────
 
-    If the interactive wizard is active for this user, route messages there.
-    Otherwise, try to interpret the message as a structured daily log template.
-    """
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None or not update.message.text:
         return
 
-    # If the user is in the wizard workflow, handle that first.
+    # Goals conversation
+    if context.user_data.get("goals_step"):
+        await _handle_goals_message(update, context)
+        return
+
+    # Wizard conversation
     if context.user_data.get("wizard"):
         await _handle_wizard_message(update, context)
         return
 
+    # Template-based log
     text = update.message.text
     if not _looks_like_daily_template(text):
         await update.message.reply_text(
-            "I couldn't recognize this as a daily log.\n"
-            "Please use /template, fill it in, and send it back as a single message."
+            "🤔 I'm not sure what to do with that.\n\n"
+            "Here's what you can do:\n"
+            "• /wizard — Guided step-by-step logging\n"
+            "• /template — Copy & fill the quick template\n"
+            "• /dashboard — Open your stats\n"
+            "• /goals — Set daily targets\n"
+            "• /help — Full guide",
         )
         return
 
     try:
         daily_log: DailyLog = extract_daily_log(text)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.exception("LLM extraction failed: %s", exc)
         await update.message.reply_text(
-            "Sorry, I couldn't parse your log. Please double‑check the template format and try again."
+            "❌ Couldn't parse your log. Please double-check the template format and try again.\n"
+            "Send /template to see the correct format."
         )
         return
 
     if update.effective_user is None:
-        await update.message.reply_text("Couldn't identify your Telegram user. Please try again.")
+        await update.message.reply_text("❌ Couldn't identify your Telegram user. Please try again.")
         return
 
     try:
         store_daily_log_structured(daily_log, telegram_user_id=int(update.effective_user.id))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.exception("Failed to store DailyLog: %s", exc)
-        await update.message.reply_text(
-            "I parsed your log but encountered a database error while saving it."
-        )
+        await update.message.reply_text("⚠️ Parsed your log but encountered a database error while saving it.")
         return
 
     num_expenses = len(daily_log.expenses)
     num_fitness = len(daily_log.fitness_activities)
     num_nutrition = len(daily_log.nutrition_items)
-
     await update.message.reply_text(
-        f"Got it! Logged {num_expenses} expenses, {num_fitness} fitness activities, "
-        f"and {num_nutrition} nutrition items for today. ✅"
+        f"✅ <b>Logged!</b>\n\n"
+        f"  💰 {num_expenses} expense(s)\n"
+        f"  🏃 {num_fitness} fitness activity/activities\n"
+        f"  🍽️ {num_nutrition} nutrition item(s)\n\n"
+        "View it on your dashboard with /dashboard 📊",
+        parse_mode=ParseMode.HTML,
     )
 
 
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
 def main() -> None:
-    """Entry point for running the Telegram bot with polling."""
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable must be set.")
 
-    application = ApplicationBuilder().token(token).build()
+    application = ApplicationBuilder().token(bot_token).build()
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("template", template))
     application.add_handler(CommandHandler("wizard", start_wizard))
     application.add_handler(CommandHandler("dashboard", dashboard))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_daily_log))
+    application.add_handler(CommandHandler("goals", goals_cmd))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Starting Omni‑Tracker bot polling...")
     application.run_polling(close_loop=False)
@@ -463,4 +762,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
