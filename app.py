@@ -10,7 +10,12 @@ from typing import List, Optional
 
 import pandas as pd
 import streamlit as st
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # On Streamlit Cloud env vars come from the app settings, not .env
 
 from database import (
     ExpenseRecord,
@@ -21,8 +26,6 @@ from database import (
     fetch_nutrition_for_telegram_user,
 )
 
-
-load_dotenv()
 
 st.set_page_config(page_title="Omni‑Tracker Dashboard", page_icon="📊", layout="wide")
 
