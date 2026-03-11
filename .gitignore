@@ -1,0 +1,19 @@
+# Python venv and caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Environment & secrets
+.env
+.env.*
+.streamlit/secrets.toml
+
+# IDE / editor
+.cursor/
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+
