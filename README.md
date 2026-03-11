@@ -77,3 +77,4 @@ You will see three tabs:
 - If environment variables or the Supabase client cannot be initialized, the code raises a clear `RuntimeError`.
 - Database operations and LLM extraction are wrapped in try/except blocks with logging for easier troubleshooting.
 
+# daily-life-tracker
