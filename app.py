@@ -120,8 +120,9 @@ def _filter_period(df: pd.DataFrame, period: str, date_col: str = "date") -> pd.
     if df.empty:
         return df
     df = df.copy()
-    df[date_col] = pd.to_datetime(df[date_col])
-    today = pd.Timestamp(date.today())
+    # Normalize to timezone-naive date strings to avoid tz comparison issues
+    df[date_col] = pd.to_datetime(df[date_col], utc=True).dt.tz_localize(None)
+    today = pd.Timestamp(datetime.utcnow().date())
     if period == "Today":
         return df[df[date_col].dt.date == today.date()]
     elif period == "This Week":
@@ -196,9 +197,16 @@ def render_overview(
     fit_df = pd.DataFrame(fitness) if fitness else pd.DataFrame()
     nut_df = pd.DataFrame(nutrition) if nutrition else pd.DataFrame()
 
-    today_exp = exp_df[pd.to_datetime(exp_df["date"]).dt.date == date.today()] if not exp_df.empty else exp_df
-    today_fit = fit_df[pd.to_datetime(fit_df["date"]).dt.date == date.today()] if not fit_df.empty else fit_df
-    today_nut = nut_df[pd.to_datetime(nut_df["date"]).dt.date == date.today()] if not nut_df.empty else nut_df
+    today_utc = datetime.utcnow().date()
+
+    def _today_rows(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        return df[pd.to_datetime(df["date"], utc=True).dt.tz_localize(None).dt.date == today_utc]
+
+    today_exp = _today_rows(exp_df)
+    today_fit = _today_rows(fit_df)
+    today_nut = _today_rows(nut_df)
 
     st.markdown("### Today's Snapshot")
     c1, c2, c3, c4 = st.columns(4)
@@ -471,6 +479,7 @@ def main() -> None:
     except Exception as exc:
         st.error(f"Failed to load data: {exc}")
         st.stop()
+
 
     overview_tab, expenses_tab, fitness_tab, nutrition_tab = st.tabs(
         ["🏠 Overview", "💸 Expenses", "🏃 Fitness", "🍽️ Nutrition"]
