@@ -105,7 +105,10 @@ class DailyLog(BaseModel):
 
 
 def _build_system_prompt() -> str:
+    today = Date.today().isoformat()  # e.g. "2026-03-12" — real date injected at call time
     return (
+        f"Today's date is {today}. Use this exact date for all entries unless the user says otherwise.\n"
+        "\n"
         "You are a smart data extraction engine for a personal tracking Telegram bot called Omni-Tracker.\n"
         "\n"
         "The user will send you a FREE-FORM message in natural language describing their day.\n"
@@ -137,7 +140,7 @@ def _build_system_prompt() -> str:
         "   - food_item: name of the food\n"
         "   - calories: integer calorie estimate. "
         "If the user provides a number use it; otherwise estimate based on common knowledge.\n"
-        "4. DATES — use today's date for all entries unless the user explicitly mentions a different date.\n"
+        f"4. DATES — use {today} for all entries unless the user explicitly mentions a different date. Never guess or invent a date.\n"
         "5. DO NOT invent entries that are not mentioned. If nothing fits a category, return an empty list.\n"
         "6. Return ONLY the structured JSON — no explanatory text.\n"
     )
