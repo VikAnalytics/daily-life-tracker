@@ -429,15 +429,15 @@ def render_nutrition_tab(tid: int, nutrition: List[NutritionRecord], goals: Goal
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    # Auth via token in URL
+    # Auth via token in URL — re-verify on every load so a fresh link always works
     token = st.query_params.get("token")
     if token and isinstance(token, str):
-        tid = _verify_and_get_tid(token)
-        if tid is None:
+        tid_from_token = _verify_and_get_tid(token)
+        if tid_from_token is None:
             st.error("This dashboard link is invalid or expired. Get a fresh one from Telegram with /dashboard.")
             st.stop()
         else:
-            st.session_state["telegram_user_id"] = tid
+            st.session_state["telegram_user_id"] = tid_from_token
 
     tid = st.session_state.get("telegram_user_id")
     if not isinstance(tid, int):
@@ -445,7 +445,25 @@ def main() -> None:
         st.info("Open this dashboard via Telegram using /dashboard to get your private link.")
         st.stop()
 
-    # Fetch all data once at the top level
+    goals = render_goals_sidebar(tid)
+
+    # Header
+    col_title, col_refresh = st.columns([5, 1])
+    with col_title:
+        st.markdown(
+            "<h1 style='margin-bottom:0'>📊 Omni‑Tracker</h1>"
+            "<p style='color:#9aa0b2;margin-top:4px'>Your personal life dashboard</p>",
+            unsafe_allow_html=True,
+        )
+    with col_refresh:
+        st.markdown("<div style='padding-top:20px'>", unsafe_allow_html=True)
+        if st.button("🔄 Refresh", use_container_width=True):
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # Fetch fresh data on every render (including after refresh button)
     try:
         expenses = fetch_expenses_for_telegram_user(tid)
         fitness = fetch_fitness_for_telegram_user(tid)
@@ -453,16 +471,6 @@ def main() -> None:
     except Exception as exc:
         st.error(f"Failed to load data: {exc}")
         st.stop()
-
-    goals = render_goals_sidebar(tid)
-
-    # Header
-    st.markdown(
-        "<h1 style='margin-bottom:0'>📊 Omni‑Tracker</h1>"
-        "<p style='color:#9aa0b2;margin-top:4px'>Your personal life dashboard</p>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("---")
 
     overview_tab, expenses_tab, fitness_tab, nutrition_tab = st.tabs(
         ["🏠 Overview", "💸 Expenses", "🏃 Fitness", "🍽️ Nutrition"]
