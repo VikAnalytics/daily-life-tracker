@@ -83,23 +83,6 @@ def _sign_dashboard_token(*, telegram_user_id: int, ttl_minutes: int = 60 * 24 *
 
 # ─── Template detection ───────────────────────────────────────────────────────
 
-TEMPLATE_TEXT: Final[str] = (
-    "💰 <b>EXPENSES:</b>\n"
-    "- [Amount] [Currency] | [Category] | [Description] | Split with: [Name1, Name2, or None]\n\n"
-    "🏋️ <b>FITNESS:</b>\n"
-    "[Activity] | [Duration in minutes]\n\n"
-    "🍎 <b>NUTRITION:</b>\n"
-    "[Food Item] | [Estimated Calories]"
-)
-
-
-def _looks_like_daily_template(text: str) -> bool:
-    normalized = text.strip()
-    return (
-        "💰 EXPENSES:" in normalized
-        and "🏋️ FITNESS:" in normalized
-        and "🍎 NUTRITION:" in normalized
-    )
 
 
 # ─── /start ───────────────────────────────────────────────────────────────────
@@ -114,13 +97,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "and show them in a beautiful dashboard.\n\n"
         "━━━━━━━━━━━━━━━\n"
         "🧭 <b>What would you like to do?</b>\n\n"
-        "📝 <b>/wizard</b> — Step-by-step daily log (recommended)\n"
-        "📋 <b>/template</b> — Copy & fill the quick text format\n"
+        "📝 <b>/wizard</b> — Step-by-step guided logging\n"
+        "💬 <b>Just type</b> — Tell me your day in plain English and I'll extract everything\n"
         "📊 <b>/dashboard</b> — Open your personal stats dashboard\n"
         "🎯 <b>/goals</b> — Set your daily fitness & calorie goals\n"
         "❓ <b>/help</b> — See all commands & tips\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "💡 <i>Tip: Use /wizard for the easiest experience — I'll ask you one question at a time!</i>",
+        "💡 <i>Tip: Just tell me your day naturally!\n"
+        'e.g. "Spent 50 USD on lunch, ran for 30 mins, had a salad ~400 cal"</i>',
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
@@ -135,44 +119,33 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📖 <b>Omni‑Tracker — Help Guide</b>\n\n"
         "━━━━━━━━━━━━━━━\n"
         "📝 <b>Logging your day</b>\n\n"
+        "  • <b>Just type naturally</b>\n"
+        "    Send any message describing your day — I'll use AI to extract\n"
+        "    expenses, fitness, and nutrition automatically.\n\n"
+        '    <i>e.g. "Had coffee for 4 USD, went to the gym for 45 mins, ate pasta ~600 cal"</i>\n\n'
         "  • <b>/wizard</b>\n"
-        "    Chat-style guided flow — I ask one thing at a time.\n"
-        "    Covers expenses → fitness → nutrition.\n\n"
-        "  • <b>/template</b>\n"
-        "    Copy the template, fill it in, and send it back in one message.\n"
-        "    Great if you want to log everything at once.\n\n"
+        "    Prefer to be guided? I'll ask one question at a time.\n\n"
         "━━━━━━━━━━━━━━━\n"
         "📊 <b>Viewing your stats</b>\n\n"
         "  • <b>/dashboard</b>\n"
         "    Sends you a private link to your personal dashboard.\n"
-        "    Works on phone — shows charts, KPIs, daily/weekly/monthly views.\n\n"
+        "    Works on phone — charts, KPIs, daily/weekly/monthly views.\n\n"
         "━━━━━━━━━━━━━━━\n"
         "🎯 <b>Setting goals</b>\n\n"
         "  • <b>/goals</b>\n"
-        "    Set your daily targets for fitness minutes and calories.\n"
+        "    Set daily targets for fitness minutes and calories.\n"
         "    Your dashboard will show progress bars vs these goals.\n\n"
         "━━━━━━━━━━━━━━━\n"
         "💡 <b>Tips</b>\n"
         "  • All your data is private — only you can see your dashboard.\n"
-        "  • Currency defaults to <code>" + DEFAULT_CURRENCY + "</code>. Mention any currency in the amount (e.g. 50 EUR).\n"
-        "  • You can log partial days — it's fine to skip sections.\n",
+        f"  • Currency defaults to <code>{DEFAULT_CURRENCY}</code> if you don't mention one.\n"
+        "  • You can log just one thing — e.g. just mention a workout.\n"
+        "  • If the AI misses something, just send a follow-up message.\n",
         parse_mode=ParseMode.HTML,
     )
 
 
 # ─── /template ────────────────────────────────────────────────────────────────
-
-async def template(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message is None:
-        return
-    await update.message.reply_text(
-        "📋 <b>Copy this template, fill in your day, and send it back:</b>\n\n"
-        + TEMPLATE_TEXT
-        + "\n\n<i>Replace the brackets with your actual values. "
-        "You can add multiple expense lines starting with '-'.</i>",
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
 
 
 # ─── /dashboard ───────────────────────────────────────────────────────────────
@@ -690,32 +663,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _handle_wizard_message(update, context)
         return
 
-    # Template-based log
+    # Free-form natural language — pass everything to the LLM
     text = update.message.text
-    if not _looks_like_daily_template(text):
+    if len(text.strip()) < 5:
         await update.message.reply_text(
-            "🤔 I'm not sure what to do with that.\n\n"
-            "Here's what you can do:\n"
-            "• /wizard — Guided step-by-step logging\n"
-            "• /template — Copy & fill the quick template\n"
-            "• /dashboard — Open your stats\n"
-            "• /goals — Set daily targets\n"
-            "• /help — Full guide",
+            "🤔 That's a bit short for me to work with!\n\n"
+            "Just describe your day naturally, e.g.:\n"
+            "<i>\"Had coffee for 4 USD, ran 30 mins, ate pasta ~600 cal\"</i>\n\n"
+            "Or use /wizard for guided step-by-step logging.",
+            parse_mode=ParseMode.HTML,
         )
         return
+
+    await update.message.reply_text("🧠 <i>Extracting your entries...</i>", parse_mode=ParseMode.HTML)
 
     try:
         daily_log: DailyLog = extract_daily_log(text)
     except Exception as exc:
         logger.exception("LLM extraction failed: %s", exc)
         await update.message.reply_text(
-            "❌ Couldn't parse your log. Please double-check the template format and try again.\n"
-            "Send /template to see the correct format."
+            "❌ I couldn't extract anything from that. Try rephrasing, or use /wizard for guided logging."
         )
         return
 
     if update.effective_user is None:
         await update.message.reply_text("❌ Couldn't identify your Telegram user. Please try again.")
+        return
+
+    num_expenses = len(daily_log.expenses)
+    num_fitness = len(daily_log.fitness_activities)
+    num_nutrition = len(daily_log.nutrition_items)
+
+    if num_expenses == 0 and num_fitness == 0 and num_nutrition == 0:
+        await update.message.reply_text(
+            "🤷 I couldn't find any expenses, fitness, or nutrition in that message.\n\n"
+            "Try being a bit more specific, e.g.:\n"
+            "<i>\"Lunch 12 USD, walked 20 mins, had a burger ~700 cal\"</i>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     try:
@@ -725,17 +710,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("⚠️ Parsed your log but encountered a database error while saving it.")
         return
 
-    num_expenses = len(daily_log.expenses)
-    num_fitness = len(daily_log.fitness_activities)
-    num_nutrition = len(daily_log.nutrition_items)
-    await update.message.reply_text(
-        f"✅ <b>Logged!</b>\n\n"
-        f"  💰 {num_expenses} expense(s)\n"
-        f"  🏃 {num_fitness} fitness activity/activities\n"
-        f"  🍽️ {num_nutrition} nutrition item(s)\n\n"
-        "View it on your dashboard with /dashboard 📊",
-        parse_mode=ParseMode.HTML,
-    )
+    # Build a human-readable confirmation of what was extracted
+    lines = ["✅ <b>Got it! Here's what I logged:</b>\n"]
+    if num_expenses:
+        lines.append("💰 <b>Expenses:</b>")
+        for e in daily_log.expenses:
+            split_note = f" (split with {', '.join(e.split_with)})" if e.split_with else ""
+            lines.append(f"  • {e.amount} {e.currency} — {e.description}{split_note}")
+    if num_fitness:
+        lines.append("\n🏃 <b>Fitness:</b>")
+        for f in daily_log.fitness_activities:
+            lines.append(f"  • {f.activity_type} — {f.duration_minutes} min")
+    if num_nutrition:
+        lines.append("\n🍽️ <b>Nutrition:</b>")
+        for n in daily_log.nutrition_items:
+            lines.append(f"  • {n.food_item} — {n.calories} kcal")
+    lines.append("\n<i>Something wrong? Just send a correction and I'll log it.</i>")
+    lines.append("View it all with /dashboard 📊")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
@@ -749,7 +742,6 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
-    application.add_handler(CommandHandler("template", template))
     application.add_handler(CommandHandler("wizard", start_wizard))
     application.add_handler(CommandHandler("dashboard", dashboard))
     application.add_handler(CommandHandler("goals", goals_cmd))
