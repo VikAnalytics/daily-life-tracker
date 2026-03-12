@@ -663,8 +663,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _handle_wizard_message(update, context)
         return
 
-    # Free-form natural language — pass everything to the LLM
+    # Greetings → show the menu
     text = update.message.text
+    greetings = {"hi", "hello", "hey", "hiya", "howdy", "sup", "yo", "helo", "hii", "hihi"}
+    if text.strip().lower().rstrip("!.,") in greetings:
+        name = update.effective_user.first_name if update.effective_user else "there"
+        await update.message.reply_text(
+            f"👋 Hey <b>{name}</b>!\n\n"
+            "Here's what I can do:\n\n"
+            "━━━━━━━━━━━━━━━\n"
+            "📝 <b>/wizard</b>\n"
+            "    Step-by-step guided logging\n\n"
+            "💬 <b>Just type freely</b>\n"
+            '    e.g. <i>"Spent 50 USD on lunch, ran 30 mins, had salad ~400 cal"</i>\n'
+            "    I'll extract everything automatically\n\n"
+            "📊 <b>/dashboard</b>\n"
+            "    Open your private stats dashboard\n\n"
+            "🎯 <b>/goals</b>\n"
+            "    Set daily fitness & calorie targets\n\n"
+            "❓ <b>/help</b>\n"
+            "    Full guide\n"
+            "━━━━━━━━━━━━━━━",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Free-form natural language — pass everything to the LLM
     if len(text.strip()) < 5:
         await update.message.reply_text(
             "🤔 That's a bit short for me to work with!\n\n"
